@@ -94,4 +94,51 @@ class SimpleQueryTest extends TestCase
 
         $this->assertEquals(-1, $theCount);
     }
+    
+    public function testIssue9() {
+        $cols = [
+            'numero_id',
+            'empresa_id',
+            'tg_username',
+            'tg_phone',
+            'tg_photo',
+            'tg_lastseen',
+            'tg_printname',
+            'tg_firstname',
+            'tg_lastname',
+            'tg_peer',
+            'tg_id',
+            'profile',
+            'st_ativo',
+            'st_instalado'
+        ];
+
+        $cols = implode(', ', $cols);
+
+        $client = new Client(["user" => $this->getDbUser(), "database" => $this::getDbName()], $this->getLoop());
+
+        $rowCount = 0;
+
+        $client->query("SELECT {$cols} FROM numero LIMIT 2")->subscribe(
+            new \Rx\Observer\CallbackObserver(
+                function ($row) use (&$rowCount) {
+                    $rowCount++;
+                },
+                function ($e) use ($client) {
+                    $this->fail();
+                    $client->closeNow();
+                    $this->cancelCurrentTimeoutTimer();
+                },
+                function () use ($client) {
+                    echo "Complete.\n";
+                    $client->closeNow();
+                    $this->cancelCurrentTimeoutTimer();
+                }
+            )
+        );
+        
+        $this->runLoopWithTimeout(2);
+        
+        $this->assertEquals(2, $rowCount);
+    }
 }
