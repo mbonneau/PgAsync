@@ -11,11 +11,17 @@ class Query implements CommandInterface
 
     protected $queryString = "";
 
-    public function __construct(string $queryString)
+    private $backpressureSubject;
+    private $backpressureRows;
+
+    public function __construct(string $queryString, Subject $backpressureSubject = null, int $backpressureRows = 100)
     {
         $this->queryString = $queryString;
 
         $this->subject = new Subject();
+
+        $this->backpressureSubject = $backpressureSubject;
+        $this->backpressureRows    = $backpressureRows;
     }
 
     public function encodedMessage(): string
@@ -31,5 +37,15 @@ class Query implements CommandInterface
     public function getQueryString(): string
     {
         return $this->queryString;
+    }
+
+    public function getBackpressureSubject(): ?Subject
+    {
+        return $this->backpressureSubject;
+    }
+
+    public function getBackpressureRows(): int
+    {
+        return $this->backpressureRows;
     }
 }

@@ -2,14 +2,21 @@
 
 namespace PgAsync\Command;
 
+use Rx\Subject\Subject;
+
 class Sync implements CommandInterface
 {
     use CommandTrait;
 
     private $description;
 
-    public function __construct(string $description = "")
+    private $backpressureSubject;
+    private $backpressureRows;
+
+    public function __construct(string $description = "", Subject $backpressureSubject = null, int $backpressureRows = 100)
     {
+        $this->backpressureSubject = $backpressureSubject;
+        $this->backpressureRows = $backpressureRows;
         $this->description = $description;
         $this->getSubject();
     }
@@ -27,5 +34,15 @@ class Sync implements CommandInterface
     public function getDescription(): string
     {
         return $this->description;
+    }
+
+    public function getBackpressureSubject(): ?Subject
+    {
+        return $this->backpressureSubject;
+    }
+
+    public function getBackpressureRows(): int
+    {
+        return $this->backpressureRows;
     }
 }

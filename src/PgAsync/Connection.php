@@ -3,6 +3,7 @@
 namespace PgAsync;
 
 use Evenement\EventEmitter;
+use Exception;
 use PgAsync\Command\Bind;
 use PgAsync\Command\Close;
 use PgAsync\Command\Describe;
@@ -33,10 +34,16 @@ use React\Dns\Resolver\Resolver;
 use React\EventLoop\LoopInterface;
 use React\SocketClient\Connector;
 use React\Stream\Stream;
+use Rx\Disposable\CallbackDisposable;
+use Rx\Disposable\CompositeDisposable;
+use Rx\Disposable\EmptyDisposable;
 use Rx\Observable;
 use Rx\Observable\AnonymousObservable;
+use Rx\Observer\CallbackObserver;
 use Rx\ObserverInterface;
 use Rx\SchedulerInterface;
+use Rx\Subject\Subject;
+use Throwable;
 
 class Connection extends EventEmitter
 {
@@ -110,8 +117,16 @@ class Connection extends EventEmitter
     private $auto_disconnect = false;
     private $password;
 
+    private $backpressureRowsWaitAfter = 100;
+    private $backpressureCountdown = 100;
+    private $backpressureSubject;
+    private $backpressureSubscription;
+    private $backpressurePaused = false;
+
     public function __construct(array $parameters, LoopInterface $loop)
     {
+        $this->backpressureSubscription = new EmptyDisposable();
+
         if (!is_array($parameters) ||
             !isset($parameters['user']) ||
             !isset($parameters['database'])
@@ -198,8 +213,19 @@ class Connection extends EventEmitter
 
     public function onData($data)
     {
+        static $backpressureData = '';
+
+        if ($backpressureData !== '') {
+            $data = $backpressureData . $data;
+            $backpressureData = '';
+        }
+
         while (strlen($data) > 0) {
             $data = $this->processData($data);
+            if ($this->backpressurePaused) {
+                $backpressureData = $data;
+                break;
+            }
         }
     }
 
@@ -233,6 +259,8 @@ class Connection extends EventEmitter
             $this->currentMessage = $message;
             return $data;
         }
+
+        return '';
 
 //        if (in_array($type, ['R', 'S', 'D', 'K', '2', '3', 'C', 'd', 'c', 'G', 'H', 'W', 'D', 'I', 'E', 'V', 'n', 'N', 'A', 't', '1', 's', 'Z', 'T'])) {
 //            $this->currentParser = [$this, 'parse1PlusLenMessage'];
@@ -288,29 +316,42 @@ class Connection extends EventEmitter
     private function handleDataRow(DataRow $dataRow)
     {
         if ($this->queryState === $this::STATE_BUSY && $this->currentCommand instanceof CommandInterface) {
-            if (count($dataRow->getColumnValues()) !== count($this->columnNames)) {
-                throw new \Exception('Expected ' . count($this->columnNames) . ' data values got ' . count($dataRow->getColumnValues()));
-            }
-            $row = array_combine($this->columnNames, $dataRow->getColumnValues());
-
-            // this should be broken out into a "data-mapper" type thing
-            // where objects can be added to allow formatting data as it is
-            // processed according to the type
-            foreach ($this->columns as $column) {
-                if ($column->typeOid === 16) { // bool
-                    if ($row[$column->name] === null) {
-                        continue;
-                    }
-                    if ($row[$column->name] === 'f') {
-                        $row[$column->name] = false;
-                        continue;
-                    }
-
-                    $row[$column->name] = true;
+//            if ($this->currentCommand->getSubject()->isDisposed()) {
+//                return;
+//            }
+//            try {
+                if (count($dataRow->getColumnValues()) !== count($this->columnNames)) {
+                    throw new \Exception('Expected ' . count($this->columnNames) . ' data values got ' . count($dataRow->getColumnValues()));
                 }
-            }
+                $row = array_combine($this->columnNames, $dataRow->getColumnValues());
 
-            $this->currentCommand->getSubject()->onNext($row);
+                // this should be broken out into a "data-mapper" type thing
+                // where objects can be added to allow formatting data as it is
+                // processed according to the type
+                foreach ($this->columns as $column) {
+                    if ($column->typeOid === 16) { // bool
+                        if ($row[$column->name] === null) {
+                            continue;
+                        }
+                        if ($row[$column->name] === 'f') {
+                            $row[$column->name] = false;
+                            continue;
+                        }
+
+                        $row[$column->name] = true;
+                    }
+                }
+
+                $this->currentCommand->getSubject()->onNext($row);
+                $this->backpressureCountdown--;
+                if ($this->backpressureSubject !== null && $this->backpressureCountdown === 0) {
+                    $this->backpressurePaused = true;
+                    $this->stream->pause();
+                    echo "pausing stream...\n";
+                }
+//            } catch (\Throwable $e) {
+//                $this->currentCommand->getSubject()->onError($e);
+//            }
         }
     }
 
@@ -353,6 +394,7 @@ class Connection extends EventEmitter
 
     private function handleCommandComplete(CommandComplete $message)
     {
+        $this->backpressureSubscription->dispose();
         if ($this->currentCommand instanceof CommandInterface) {
             $this->currentCommand->getSubject()->onCompleted();
         }
@@ -418,6 +460,7 @@ class Connection extends EventEmitter
         $this->connStatus     = $this::CONNECTION_OK;
         $this->queryState     = $this::STATE_READY;
         $this->currentCommand = null;
+        $this->backpressureSubject = null;
         $this->processQueue();
     }
 
@@ -460,11 +503,43 @@ class Connection extends EventEmitter
                 $this->stream->end();
             }
             if ($c->shouldWaitForComplete()) {
+                $this->backpressureSubject = null;
+                $this->backpressurePaused = false;
+                $this->backpressureSubscription = new EmptyDisposable();
+
                 $this->queryState = $this::STATE_BUSY;
                 if ($c instanceof Query) {
+                    $this->backpressureSubject = $c->getBackpressureSubject();
                     $this->queryType = $this::QUERY_SIMPLE;
                 } elseif ($c instanceof Sync) {
+                    $this->backpressureSubject = $c->getBackpressureSubject();
                     $this->queryType = $this::QUERY_EXTENDED;
+                }
+
+                if ($this->backpressureSubject !== null) {
+                    // reset backpressure
+                    $this->backpressureCountdown = $c->getBackpressureRows();
+                    $backpressureObserver = new CallbackObserver(
+                        function ($x) {
+                            $this->backpressureCountdown = $this->backpressureRowsWaitAfter;
+                            $this->backpressurePaused = false;
+                            $this->stream->resume();
+                            $this->onData(''); // force backlogged buffer to get processed
+                        },
+                        function (Throwable $e) {
+                            throw new Exception('Exception caught on backpressure subject' . $e->getMessage());
+                        },
+                        function () {
+                            // on complete we assume that backpressure control is no longer wanted
+                            $this->backpressureCountdown = $this->backpressureRowsWaitAfter;
+                            $this->backpressureSubject = null;
+                            $this->backpressureSubscription->dispose();
+                            $this->backpressurePaused = false;
+                            $this->stream->resume();
+                            $this->onData(''); // force backlogged buffer to get processed
+                        }
+                    );
+                    $this->backpressureSubscription = $this->backpressureSubject->subscribe($backpressureObserver);
                 }
 
                 $this->currentCommand = $c;
@@ -474,11 +549,11 @@ class Connection extends EventEmitter
         }
     }
 
-    public function query($query): Observable
+    public function query($query, Subject $backpressureSubject = null, int $backpressureRows = 100): Observable
     {
         return new AnonymousObservable(
-            function (ObserverInterface $observer, SchedulerInterface $scheduler = null) use ($query) {
-                $q = new Query($query);
+            function (ObserverInterface $observer, SchedulerInterface $scheduler = null) use ($query, $backpressureSubject, $backpressureRows) {
+                $q = new Query($query, $backpressureSubject, $backpressureRows);
                 $this->commandQueue->enqueue($q);
                 if ($this->auto_disconnect) {
                     $this->commandQueue->enqueue(new Terminate());
@@ -494,7 +569,7 @@ class Connection extends EventEmitter
 
     }
 
-    public function executeStatement(string $queryString, array $parameters = []): Observable
+    public function executeStatement(string $queryString, array $parameters = [], Subject $backpressureSubject = null, int $backpressureRows = 100): Observable
     {
         /**
          * http://git.postgresql.org/gitweb/?p=postgresql.git;a=blob;f=src/interfaces/libpq/fe-exec.c;h=828f18e1110119efc3bf99ecf16d98ce306458ea;hb=6bcce25801c3fcb219e0d92198889ec88c74e2ff#l1381
@@ -519,7 +594,7 @@ class Connection extends EventEmitter
          */
 
         return new AnonymousObservable(
-            function (ObserverInterface $observer, SchedulerInterface $scheduler = null) use ($queryString, $parameters) {
+            function (ObserverInterface $observer, SchedulerInterface $scheduler = null) use ($queryString, $parameters, $backpressureSubject, $backpressureRows) {
                 $name = 'somestatement';
 
                 $close = new Close($name);
@@ -537,7 +612,7 @@ class Connection extends EventEmitter
                 $execute = new Execute();
                 $this->commandQueue->enqueue($execute);
 
-                $sync = new Sync($queryString);
+                $sync = new Sync($queryString, $backpressureSubject, $backpressureRows);
                 $this->commandQueue->enqueue($sync);
 
                 if ($this->auto_disconnect) {

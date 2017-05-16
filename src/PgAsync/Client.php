@@ -5,6 +5,7 @@ namespace PgAsync;
 use Evenement\EventEmitterInterface;
 use Evenement\EventEmitterTrait;
 use React\EventLoop\LoopInterface;
+use Rx\Subject\Subject;
 
 class Client implements EventEmitterInterface
 {
@@ -43,11 +44,11 @@ class Client implements EventEmitterInterface
         return $conn->query($s);
     }
 
-    public function executeStatement(string $queryString, array $parameters = [])
+    public function executeStatement(string $queryString, array $parameters = [], Subject $backpressureSubject = null, int $backpressureRows = 100)
     {
         $conn = $this->getIdleConnection();
 
-        return $conn->executeStatement($queryString, $parameters);
+        return $conn->executeStatement($queryString, $parameters, $backpressureSubject, $backpressureRows);
     }
 
     public function getIdleConnection(): Connection
