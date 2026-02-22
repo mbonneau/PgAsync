@@ -5,6 +5,7 @@ on:
       - 'master'
       - 'refs/heads/[0-9]+.[0-9]+.[0-9]+'
   pull_request:
+  workflow_dispatch:
 jobs:
   supported-versions-matrix:
     name: Supported Versions Matrix
